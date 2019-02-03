@@ -20,6 +20,8 @@ import (
 	"code.gitea.io/gitea/routers"
 	"code.gitea.io/gitea/routers/routes"
 
+	"github.com/coreos/go-systemd/activation" // Used for socket activation
+
 	"github.com/Unknwon/com"
 	context2 "github.com/gorilla/context"
 	"github.com/urfave/cli"
@@ -159,12 +161,6 @@ func runWeb(ctx *cli.Context) error {
 		}
 	}
 
-	listenAddr := setting.HTTPAddr
-	if setting.Protocol != setting.UnixSocket {
-		listenAddr += ":" + setting.HTTPPort
-	}
-	log.Info("Listen: %v://%s%s", setting.Protocol, listenAddr, setting.AppSubURL)
-
 	if setting.LFS.StartServer {
 		log.Info("LFS server enabled")
 	}
@@ -177,43 +173,60 @@ func runWeb(ctx *cli.Context) error {
 	}
 
 	var err error
-	switch setting.Protocol {
-	case setting.HTTP:
-		err = runHTTP(listenAddr, context2.ClearHandler(m))
-	case setting.HTTPS:
-		if setting.EnableLetsEncrypt {
-			err = runLetsEncrypt(listenAddr, setting.Domain, setting.LetsEncryptDirectory, setting.LetsEncryptEmail, context2.ClearHandler(m))
-			break
+	listeners, err := activation.Listeners()
+	if err == nil {
+		// use systemd socket activation
+		log.Info("Listen to systemd socket")
+		if len(listeners) != 1 {
+			log.Fatal(4, "Unexpected number of socket activation fds")
 		}
-		if setting.RedirectOtherPort {
-			go runHTTPRedirector()
+		err = http.Serve(listeners[0], context2.ClearHandler(m))
+	} else {
+		// no systemd socket available, look into settings
+		listenAddr := setting.HTTPAddr
+		if setting.Protocol != setting.UnixSocket {
+			listenAddr += ":" + setting.HTTPPort
 		}
-		err = runHTTPS(listenAddr, setting.CertFile, setting.KeyFile, context2.ClearHandler(m))
-	case setting.FCGI:
-		listener, err := net.Listen("tcp", listenAddr)
-		if err != nil {
-			log.Fatal(4, "Failed to bind %s", listenAddr, err)
-		}
-		defer listener.Close()
-		err = fcgi.Serve(listener, context2.ClearHandler(m))
-	case setting.UnixSocket:
-		if err := os.Remove(listenAddr); err != nil && !os.IsNotExist(err) {
-			log.Fatal(4, "Failed to remove unix socket directory %s: %v", listenAddr, err)
-		}
-		var listener *net.UnixListener
-		listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: listenAddr, Net: "unix"})
-		if err != nil {
-			break // Handle error after switch
-		}
+		log.Info("Listen: %v://%s%s", setting.Protocol, listenAddr, setting.AppSubURL)
 
-		// FIXME: add proper implementation of signal capture on all protocols
-		// execute this on SIGTERM or SIGINT: listener.Close()
-		if err = os.Chmod(listenAddr, os.FileMode(setting.UnixSocketPermission)); err != nil {
-			log.Fatal(4, "Failed to set permission of unix socket: %v", err)
+		switch setting.Protocol {
+		case setting.HTTP:
+			err = runHTTP(listenAddr, context2.ClearHandler(m))
+		case setting.HTTPS:
+			if setting.EnableLetsEncrypt {
+				err = runLetsEncrypt(listenAddr, setting.Domain, setting.LetsEncryptDirectory, setting.LetsEncryptEmail, context2.ClearHandler(m))
+				break
+			}
+			if setting.RedirectOtherPort {
+				go runHTTPRedirector()
+			}
+			err = runHTTPS(listenAddr, setting.CertFile, setting.KeyFile, context2.ClearHandler(m))
+		case setting.FCGI:
+			listener, err := net.Listen("tcp", listenAddr)
+			if err != nil {
+				log.Fatal(4, "Failed to bind %s", listenAddr, err)
+			}
+			defer listener.Close()
+			err = fcgi.Serve(listener, context2.ClearHandler(m))
+		case setting.UnixSocket:
+			if err := os.Remove(listenAddr); err != nil && !os.IsNotExist(err) {
+				log.Fatal(4, "Failed to remove unix socket directory %s: %v", listenAddr, err)
+			}
+			var listener *net.UnixListener
+			listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: listenAddr, Net: "unix"})
+			if err != nil {
+				break // Handle error after switch
+			}
+
+			// FIXME: add proper implementation of signal capture on all protocols
+			// execute this on SIGTERM or SIGINT: listener.Close()
+			if err = os.Chmod(listenAddr, os.FileMode(setting.UnixSocketPermission)); err != nil {
+				log.Fatal(4, "Failed to set permission of unix socket: %v", err)
+			}
+			err = http.Serve(listener, context2.ClearHandler(m))
+		default:
+			log.Fatal(4, "Invalid protocol: %s", setting.Protocol)
 		}
-		err = http.Serve(listener, context2.ClearHandler(m))
-	default:
-		log.Fatal(4, "Invalid protocol: %s", setting.Protocol)
 	}
 
 	if err != nil {
